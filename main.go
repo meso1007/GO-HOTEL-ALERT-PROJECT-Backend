@@ -2,11 +2,13 @@ package main
 
 import (
 	"database/sql"
+	"encoding/json"
 	"fmt"
 	"log"
 	"net/http"
 	"net/smtp"
 	"os"
+	"regexp"
 	"strconv"
 	"strings"
 	"time"
@@ -34,7 +36,25 @@ func main() {
 
 	// Webサーバーを起動
 	http.HandleFunc("/api/alerts", func(w http.ResponseWriter, r *http.Request) {
-		handleCreateAlert(w, r, db)
+		// CORSヘッダーをここで一元管理
+		w.Header().Set("Access-Control-Allow-Origin", "*") // 本番環境では 'http://localhost:3000' のように限定してください
+		w.Header().Set("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
+		w.Header().Set("Access-Control-Allow-Headers", "Content-Type")
+
+		// プリフライトリクエスト(OPTIONS)に対応
+		if r.Method == "OPTIONS" {
+			w.WriteHeader(http.StatusOK)
+			return
+		}
+
+		switch r.Method {
+		case "POST":
+			handleCreateAlert(w, r, db)
+		case "GET":
+			handleGetAlerts(w, r, db)
+		default:
+			http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+		}
 	})
 
 	fmt.Println("サーバーがポート8080で起動しました...")
@@ -58,22 +78,22 @@ func checkAndNotify(db *sql.DB) {
 	fmt.Printf("%d件のアラートをチェックします...\n", len(alerts))
 
 	for _, alert := range alerts {
-		currentPrice, err := scrapeHotelPrice(alert.HotelURL)
+		hotelInfo, err := scrapeHotelInfo(alert.HotelURL)
 		if err != nil {
 			log.Printf("価格のスクレイピングに失敗しました (%s): %v", alert.HotelURL, err)
 			continue
 		}
 
-		fmt.Printf("ホテルID %d: 現在の価格 %d円, 目標価格 %d円\n", alert.ID, currentPrice, alert.TargetPrice)
+		fmt.Printf("ホテル「%s」(ID:%d): 現在の価格 %d円, 目標価格 %d円\n", hotelInfo.Name, alert.ID, hotelInfo.Price, alert.TargetPrice)
 
-		if currentPrice <= alert.TargetPrice {
+		if hotelInfo.Price <= alert.TargetPrice {
 			email, err := getUserEmail(db, alert.UserID)
 			if err != nil {
 				log.Printf("ユーザーのメールアドレス取得に失敗しました: %v", err)
 				continue
 			}
 
-			err = sendNotification(email, alert.HotelURL, currentPrice)
+			err = sendNotification(email, alert.HotelURL, hotelInfo.Price, hotelInfo.Name)
 			if err != nil {
 				log.Printf("通知メールの送信に失敗しました: %v", err)
 				continue
@@ -176,15 +196,6 @@ func insertAlert(db *sql.DB, userID int, hotelURL string, targetPrice int) (*Ale
 
 // handleCreateAlert はアラート登録APIのエンドポイントです
 func handleCreateAlert(w http.ResponseWriter, r *http.Request, db *sql.DB) {
-	// CORS設定
-	w.Header().Set("Access-Control-Allow-Origin", "*")
-	w.Header().Set("Access-Control-Allow-Methods", "POST, OPTIONS")
-	w.Header().Set("Access-Control-Allow-Headers", "Content-Type")
-
-	if r.Method == "OPTIONS" {
-		w.WriteHeader(http.StatusOK)
-		return
-	}
 	if r.Method != "POST" {
 		http.Error(w, "Invalid request method", http.StatusMethodNotAllowed)
 		return
@@ -232,39 +243,92 @@ func handleCreateAlert(w http.ResponseWriter, r *http.Request, db *sql.DB) {
 	fmt.Fprintf(w, "アラートが正常に登録されました。")
 }
 
-// scrapeHotelPrice は指定されたホテルの現在の価格をスクレイピングします
-func scrapeHotelPrice(url string) (int, error) {
-	// 楽天トラベルのページにHTTPリクエストを送信
-	res, err := http.Get(url)
+// HotelInfo はスクレイピングで取得したホテルの情報を保持します
+type HotelInfo struct {
+	Price int
+	Name  string
+}
+
+// scrapeHotelInfo は指定されたホテルの現在の価格と名前をスクレイピングします
+func scrapeHotelInfo(url string) (*HotelInfo, error) {
+	// http.Getではヘッダーをカスタマイズできないため、http.Clientを使用します
+	client := &http.Client{
+		// タイムアウトを設定して、リクエストが長引くのを防ぎます
+		Timeout: 30 * time.Second,
+	}
+	req, err := http.NewRequest("GET", url, nil)
 	if err != nil {
-		return 0, fmt.Errorf("HTTPリクエストに失敗しました: %w", err)
+		return nil, fmt.Errorf("リクエストの作成に失敗しました: %w", err)
+	}
+
+	// 一般的なブラウザのUser-Agentを設定します
+	req.Header.Set("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36")
+
+	res, err := client.Do(req)
+	if err != nil {
+		return nil, fmt.Errorf("HTTPリクエストに失敗しました: %w", err)
 	}
 	defer res.Body.Close()
 
 	if res.StatusCode != 200 {
-		return 0, fmt.Errorf("ステータスコードが異常です: %d %s", res.StatusCode, res.Status)
+		return nil, fmt.Errorf("ステータスコードが異常です: %d %s", res.StatusCode, res.Status)
 	}
 
-	// HTMLをGoQueryで解析
 	doc, err := goquery.NewDocumentFromReader(res.Body)
 	if err != nil {
-		return 0, fmt.Errorf("HTML解析に失敗しました: %w", err)
+		return nil, fmt.Errorf("HTML解析に失敗しました: %w", err)
 	}
 
-	// 価格情報を含む要素を検索（セレクタを修正）
-	priceStr := doc.Find(".roomType-charge-price").First().Text()
+	var priceStr string
+	var selector string
+	var name string
 
-	// 取得した文字列からカンマと不要な文字を削除
-	priceStr = strings.ReplaceAll(priceStr, ",", "")
-	priceStr = strings.TrimSpace(priceStr)
+	// URLに基づいてサイトを判別し、適切なセレクタを選択
+	if strings.Contains(url, "travel.rakuten.co.jp") {
+		// 楽天トラベルのセレクタ (複数の可能性に対応)
+		// ホテル名 (ホテルトップページ用とプランページ用)
+		name = doc.Find("#htlName").Text()
+		if name == "" {
+			name = doc.Find("h1.head-hotel-name").Text()
+		}
+		name = strings.TrimSpace(name)
+
+		// 価格 (検索結果ページ用とプラン詳細ページ用のセレクタを両方試す)
+		selector = ".price--num, .rm-prc-prc"
+		priceStr = doc.Find(selector).First().Text()
+	} else if strings.Contains(url, "booking.com") {
+		// Booking.comの価格セレクタの例
+		selector = "[data-testid='price-and-discounted-price']"
+		priceStr = doc.Find(selector).First().Text()
+		name = strings.TrimSpace(doc.Find(".d2fee87262.pp-header__title").Text())
+	} else {
+		// フォールバックまたは他のサイト用のセレクタ
+		selector = ".roomType-charge-price" // 元のセレクタ
+		priceStr = doc.Find(selector).First().Text()
+		name = "Unknown Hotel"
+	}
+
+	if priceStr == "" {
+		return nil, fmt.Errorf("価格情報が見つかりませんでした。セレクタ '%s' を確認してください。", selector)
+	}
+
+	// 数字のみを抽出する正規表現
+	re := regexp.MustCompile(`[0-9]+`)
+	digits := re.FindAllString(priceStr, -1)
+	if len(digits) == 0 {
+		return nil, fmt.Errorf("価格文字列から数字を抽出できませんでした: '%s'", priceStr)
+	}
+
+	// 抽出した数字を結合（例: "￥1,234" -> ["1", "234"] -> "1234"）
+	priceStr = strings.Join(digits, "")
 
 	// 文字列を整数に変換
 	price, err := strconv.Atoi(priceStr)
 	if err != nil {
-		return 0, fmt.Errorf("価格のパースに失敗しました: %w", err)
+		return nil, fmt.Errorf("価格のパースに失敗しました: %w (元文字列: '%s')", err, priceStr)
 	}
 
-	return price, nil
+	return &HotelInfo{Price: price, Name: name}, nil
 }
 
 func getActiveAlerts(db *sql.DB) ([]Alert, error) {
@@ -308,7 +372,7 @@ func getUserByEmail(db *sql.DB, email string) (*User, error) {
 }
 
 // sendNotification はユーザーに通知メールを送信します
-func sendNotification(email string, hotelURL string, currentPrice int) error {
+func sendNotification(email string, hotelURL string, currentPrice int, hotelName string) error {
 	// TODO: あなたのメールアドレスとアプリパスワードを設定してください
 	from := "あなたのメールアドレス"
 	password := "あなたのアプリパスワード"
@@ -316,15 +380,15 @@ func sendNotification(email string, hotelURL string, currentPrice int) error {
 	smtpPort := "587"
 
 	to := []string{email}
-	subject := "Subject: ホテルの価格が目標を下回りました！\n"
+	subject := fmt.Sprintf("Subject: 【価格アラート】%sの価格が目標を下回りました！\n", hotelName)
 	body := fmt.Sprintf(`
-価格が目標価格を下回りました！
+「%s」の価格が目標価格を下回りました！
 
-ホテルURL: %s
 現在の価格: %d円
+ホテルURL: %s
 
 今すぐチェックしましょう！
-`, hotelURL, currentPrice)
+`, hotelName, currentPrice, hotelURL)
 
 	msg := []byte(subject + "\n" + body)
 
@@ -336,6 +400,49 @@ func sendNotification(email string, hotelURL string, currentPrice int) error {
 
 	log.Printf("通知メールを送信しました: %s", email)
 	return nil
+}
+
+// handleGetAlerts はアラート一覧を取得するAPIエンドポイントです
+func handleGetAlerts(w http.ResponseWriter, r *http.Request, db *sql.DB) {
+	w.Header().Set("Content-Type", "application/json")
+
+	// アクティブなアラートを取得
+	alerts, err := getActiveAlerts(db)
+	if err != nil {
+		http.Error(w, fmt.Sprintf("アラートの取得に失敗しました: %v", err), http.StatusInternalServerError)
+		return
+	}
+
+	// フロントエンド用のレスポンス形式に変換
+	var responseAlerts []map[string]interface{}
+	for _, alert := range alerts {
+		// 現在の価格をスクレイピング（エラーが発生した場合は0を設定）
+		hotelInfo, err := scrapeHotelInfo(alert.HotelURL)
+		currentPrice := 0
+		hotelName := "ホテル情報の取得に失敗"
+		if err != nil {
+			log.Printf("価格のスクレイピングに失敗しました (%s): %v", alert.HotelURL, err)
+		} else {
+			currentPrice = hotelInfo.Price
+			hotelName = hotelInfo.Name
+		}
+
+		responseAlert := map[string]interface{}{
+			"id":           alert.ID,
+			"hotel":        hotelName,
+			"currentPrice": currentPrice,
+			"targetPrice":  alert.TargetPrice,
+			"status":       "active",
+		}
+		responseAlerts = append(responseAlerts, responseAlert)
+	}
+
+	response := map[string]interface{}{
+		"success": true,
+		"alerts":  responseAlerts,
+	}
+
+	json.NewEncoder(w).Encode(response)
 }
 
 // deactivateAlert は指定されたアラートを無効化します
